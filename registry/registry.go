@@ -31,6 +31,198 @@ type mdnsRegistry struct {
 	listener chan *mdns.ServiceEntry
 }
 
+func (m *mdnsRegistry) GetService(ctx context.Context, serviceName string) ([]*registry.ServiceInstance, error) {
+	serviceMap := make(map[string]*Service)
+	entries := make(chan *mdns.ServiceEntry, 10)
+	done := make(chan bool)
+
+	p := mdns.DefaultParams(serviceName)
+	// set context with timeout
+	var cancel context.CancelFunc
+	p.Context, cancel = context.WithTimeout(context.Background(), m.opts.Timeout)
+	defer cancel()
+	// set entries channel
+	p.Entries = entries
+	// set the domain
+	p.Domain = m.domain
+
+	go func() {
+		for {
+			select {
+			case e := <-entries:
+				// list record so skip
+				if p.Service == "_services" {
+					continue
+				}
+				if p.Domain != m.domain {
+					continue
+				}
+				if e.TTL == 0 {
+					continue
+				}
+
+				txt, err := decode(e.InfoFields)
+				if err != nil {
+					continue
+				}
+
+				if txt.Service != serviceName {
+					continue
+				}
+
+				s, ok := serviceMap[txt.Version]
+				if !ok {
+					s = &Service{
+						Name:      txt.Service,
+						Version:   txt.Version,
+						Endpoints: txt.Endpoints,
+					}
+				}
+				addr := ""
+				// prefer ipv4 addrs
+				if len(e.AddrV4) > 0 {
+					addr = e.AddrV4.String()
+					// else use ipv6
+				} else if len(e.AddrV6) > 0 {
+					addr = "[" + e.AddrV6.String() + "]"
+				} else {
+					//if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+					//	logger.Infof("[mdns]: invalid endpoint received: %v", e)
+					//}
+					continue
+				}
+				s.Nodes = append(s.Nodes, &Node{
+					Id:       strings.TrimSuffix(e.Name, "."+p.Service+"."+p.Domain+"."),
+					Address:  fmt.Sprintf("%s:%d", addr, e.Port),
+					Metadata: txt.Metadata,
+				})
+
+				serviceMap[txt.Version] = s
+			case <-p.Context.Done():
+				close(done)
+				return
+			}
+		}
+	}()
+
+	// execute the query
+	if err := mdns.Query(p); err != nil {
+		return nil, err
+	}
+
+	// wait for completion
+	<-done
+
+	// create list and return
+	services := make([]*registry.ServiceInstance, 0, len(serviceMap))
+
+	for _, service := range serviceMap {
+		services = append(services, &registry.ServiceInstance{
+			ID:        service.Name,
+			Name:      service.Name,
+			Version:   service.Version,
+			Metadata:  service.Metadata,
+			Endpoints: service.Endpoints,
+		})
+	}
+
+	return services, nil
+}
+
+func (m *mdnsRegistry) Watch(ctx context.Context, serviceName string) (registry.Watcher, error) {
+	var wo WatchOptions
+	wo.Context = ctx
+	wo.Service = serviceName
+
+	md := &mdnsWatcher{
+		id:       uuid.New().String(),
+		wo:       wo,
+		ch:       make(chan *mdns.ServiceEntry, 32),
+		exit:     make(chan struct{}),
+		domain:   m.domain,
+		registry: m,
+	}
+
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	// save the watcher
+	m.watchers[md.id] = md
+
+	// check of the listener exists
+	if m.listener != nil {
+		return md, nil
+	}
+
+	// start the listener
+	go func() {
+		// go to infinity
+		for {
+			m.mtx.Lock()
+
+			// just return if there are no watchers
+			if len(m.watchers) == 0 {
+				m.listener = nil
+				m.mtx.Unlock()
+				return
+			}
+
+			// check existing listener
+			if m.listener != nil {
+				m.mtx.Unlock()
+				return
+			}
+
+			// reset the listener
+			exit := make(chan struct{})
+			ch := make(chan *mdns.ServiceEntry, 32)
+			m.listener = ch
+
+			m.mtx.Unlock()
+
+			// send messages to the watchers
+			go func() {
+				send := func(w *mdnsWatcher, e *mdns.ServiceEntry) {
+					select {
+					case w.ch <- e:
+					default:
+					}
+				}
+
+				for {
+					select {
+					case <-exit:
+						return
+					case e, ok := <-ch:
+						if !ok {
+							return
+						}
+						m.mtx.RLock()
+						// send service entry to all watchers
+						for _, w := range m.watchers {
+							send(w, e)
+						}
+						m.mtx.RUnlock()
+					}
+				}
+
+			}()
+
+			// start listening, blocking call
+			mdns.Listen(ch, exit)
+
+			// mdns.Listen has unblocked
+			// kill the saved listener
+			m.mtx.Lock()
+			m.listener = nil
+			close(ch)
+			m.mtx.Unlock()
+		}
+	}()
+
+	return md, nil
+}
+
 // NewRegistry returns a new default registry which is mdns
 func NewRegistry(opts ...Option) registry.Registrar {
 	return newRegistry(opts...)
@@ -212,98 +404,6 @@ func (m *mdnsRegistry) Options() Options {
 	return m.opts
 }
 
-func (m *mdnsRegistry) GetService(service string, opts ...GetOption) ([]*Service, error) {
-	serviceMap := make(map[string]*Service)
-	entries := make(chan *mdns.ServiceEntry, 10)
-	done := make(chan bool)
-
-	p := mdns.DefaultParams(service)
-	// set context with timeout
-	var cancel context.CancelFunc
-	p.Context, cancel = context.WithTimeout(context.Background(), m.opts.Timeout)
-	defer cancel()
-	// set entries channel
-	p.Entries = entries
-	// set the domain
-	p.Domain = m.domain
-
-	go func() {
-		for {
-			select {
-			case e := <-entries:
-				// list record so skip
-				if p.Service == "_services" {
-					continue
-				}
-				if p.Domain != m.domain {
-					continue
-				}
-				if e.TTL == 0 {
-					continue
-				}
-
-				txt, err := decode(e.InfoFields)
-				if err != nil {
-					continue
-				}
-
-				if txt.Service != service {
-					continue
-				}
-
-				s, ok := serviceMap[txt.Version]
-				if !ok {
-					s = &Service{
-						Name:      txt.Service,
-						Version:   txt.Version,
-						Endpoints: txt.Endpoints,
-					}
-				}
-				addr := ""
-				// prefer ipv4 addrs
-				if len(e.AddrV4) > 0 {
-					addr = e.AddrV4.String()
-					// else use ipv6
-				} else if len(e.AddrV6) > 0 {
-					addr = "[" + e.AddrV6.String() + "]"
-				} else {
-					//if logger.V(logger.InfoLevel, logger.DefaultLogger) {
-					//	logger.Infof("[mdns]: invalid endpoint received: %v", e)
-					//}
-					continue
-				}
-				s.Nodes = append(s.Nodes, &Node{
-					Id:       strings.TrimSuffix(e.Name, "."+p.Service+"."+p.Domain+"."),
-					Address:  fmt.Sprintf("%s:%d", addr, e.Port),
-					Metadata: txt.Metadata,
-				})
-
-				serviceMap[txt.Version] = s
-			case <-p.Context.Done():
-				close(done)
-				return
-			}
-		}
-	}()
-
-	// execute the query
-	if err := mdns.Query(p); err != nil {
-		return nil, err
-	}
-
-	// wait for completion
-	<-done
-
-	// create list and return
-	services := make([]*Service, 0, len(serviceMap))
-
-	for _, service := range serviceMap {
-		services = append(services, service)
-	}
-
-	return services, nil
-}
-
 func (m *mdnsRegistry) ListServices(opts ...ListOption) ([]*Service, error) {
 	serviceMap := make(map[string]bool)
 	entries := make(chan *mdns.ServiceEntry, 10)
@@ -352,101 +452,6 @@ func (m *mdnsRegistry) ListServices(opts ...ListOption) ([]*Service, error) {
 	<-done
 
 	return services, nil
-}
-
-func (m *mdnsRegistry) Watch(opts ...WatchOption) (registry.Watcher, error) {
-	var wo WatchOptions
-	for _, o := range opts {
-		o(&wo)
-	}
-
-	md := &mdnsWatcher{
-		id:       uuid.New().String(),
-		wo:       wo,
-		ch:       make(chan *mdns.ServiceEntry, 32),
-		exit:     make(chan struct{}),
-		domain:   m.domain,
-		registry: m,
-	}
-
-	m.mtx.Lock()
-	defer m.mtx.Unlock()
-
-	// save the watcher
-	m.watchers[md.id] = md
-
-	// check of the listener exists
-	if m.listener != nil {
-		return md, nil
-	}
-
-	// start the listener
-	go func() {
-		// go to infinity
-		for {
-			m.mtx.Lock()
-
-			// just return if there are no watchers
-			if len(m.watchers) == 0 {
-				m.listener = nil
-				m.mtx.Unlock()
-				return
-			}
-
-			// check existing listener
-			if m.listener != nil {
-				m.mtx.Unlock()
-				return
-			}
-
-			// reset the listener
-			exit := make(chan struct{})
-			ch := make(chan *mdns.ServiceEntry, 32)
-			m.listener = ch
-
-			m.mtx.Unlock()
-
-			// send messages to the watchers
-			go func() {
-				send := func(w *mdnsWatcher, e *mdns.ServiceEntry) {
-					select {
-					case w.ch <- e:
-					default:
-					}
-				}
-
-				for {
-					select {
-					case <-exit:
-						return
-					case e, ok := <-ch:
-						if !ok {
-							return
-						}
-						m.mtx.RLock()
-						// send service entry to all watchers
-						for _, w := range m.watchers {
-							send(w, e)
-						}
-						m.mtx.RUnlock()
-					}
-				}
-
-			}()
-
-			// start listening, blocking call
-			mdns.Listen(ch, exit)
-
-			// mdns.Listen has unblocked
-			// kill the saved listener
-			m.mtx.Lock()
-			m.listener = nil
-			close(ch)
-			m.mtx.Unlock()
-		}
-	}()
-
-	return md, nil
 }
 
 func (m *mdnsRegistry) String() string {

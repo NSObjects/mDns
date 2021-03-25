@@ -22,76 +22,95 @@ type mdnsWatcher struct {
 }
 
 func (m *mdnsWatcher) Next() ([]*registry.ServiceInstance, error) {
-	for {
-		select {
-		case e := <-m.ch:
-			txt, err := decode(e.InfoFields)
-			if err != nil {
-				continue
-			}
-
-			if len(txt.Service) == 0 || len(txt.Version) == 0 {
-				continue
-			}
-
-			// Filter watch options
-			// wo.Service: Only keep services we care about
-			if len(m.wo.Service) > 0 && txt.Service != m.wo.Service {
-				continue
-			}
-			var action string
-			if e.TTL == 0 {
-				action = "delete"
-			} else {
-				action = "create"
-			}
-
-			service := &registry.ServiceInstance{
-				Name:      txt.Service,
-				Version:   txt.Version,
-				Endpoints: txt.Endpoints,
-			}
-
-			// skip anything without the domain we care about
-			suffix := fmt.Sprintf(".%s.%s.", service.Name, m.domain)
-			if !strings.HasSuffix(e.Name, suffix) {
-				continue
-			}
-
-			var addr string
-			if len(e.AddrV4) > 0 {
-				addr = e.AddrV4.String()
-			} else if len(e.AddrV6) > 0 {
-				addr = "[" + e.AddrV6.String() + "]"
-			} else {
-				addr = e.Addr.String()
-			}
-
-			//service.Nodes = append(service.Nodes, &Node{
-			//	Id:       strings.TrimSuffix(e.Name, suffix),
-			//	Address:  fmt.Sprintf("%s:%d", addr, e.Port),
-			//	Metadata: txt.Metadata,
-			//})
-
-			var ss  []*registry.ServiceInstance
-			for _,v :=range m.registry.watchers {
-				ss = append(ss,&registry.ServiceInstance{
-					ID:        ,
-					Name:      "",
-					Version:   "",
-					Metadata:  nil,
-					Endpoints: nil,
-				})
-			}
-
-			return &Result{
-				Action:  action,
-				Service: service,
-			}, nil
-		case <-m.exit:
-			return nil, ErrWatcherStopped
+	var services []*registry.ServiceInstance
+	select {
+	case e := <-m.ch:
+		txt, err := decode(e.InfoFields)
+		if err != nil {
+			return nil, err
 		}
+		if len(txt.Service) == 0 || len(txt.Version) == 0 {
+			return nil, err
+		}
+		// Filter watch options
+		// wo.Service: Only keep services we care about
+		if len(m.wo.Service) > 0 && txt.Service != m.wo.Service {
+			break
+		}
+
+		// skip anything without the domain we care about
+		suffix := fmt.Sprintf(".%s.%s.", txt.Service, m.domain)
+		if !strings.HasSuffix(e.Name, suffix) {
+			break
+		}
+
+		var addr string
+		if len(e.AddrV4) > 0 {
+			addr = e.AddrV4.String()
+		} else if len(e.AddrV6) > 0 {
+			addr = "[" + e.AddrV6.String() + "]"
+		} else {
+			addr = e.Addr.String()
+		}
+
+		txt.Endpoints = append(txt.Endpoints, fmt.Sprintf("%s:%d", addr, e.Port))
+		services = append(services, &registry.ServiceInstance{
+			ID:        strings.TrimSuffix(e.Name, suffix),
+			Name:      e.Name,
+			Version:   txt.Version,
+			Metadata:  txt.Metadata,
+			Endpoints: txt.Endpoints,
+		})
+	case <-m.exit:
+		return nil, ErrWatcherStopped
 	}
+
+	for _, v := range m.registry.watchers {
+		if v.id == m.id {
+			continue
+		}
+		e := <-v.ch
+
+		txt, err := decode(e.InfoFields)
+		if err != nil {
+			return nil, err
+		}
+		if len(txt.Service) == 0 || len(txt.Version) == 0 {
+			return nil, err
+		}
+		// Filter watch options
+		// wo.Service: Only keep services we care about
+		if len(m.wo.Service) > 0 && txt.Service != m.wo.Service {
+			continue
+		}
+		// skip anything without the domain we care about
+		suffix := fmt.Sprintf(".%s.%s.", txt.Service, m.domain)
+		if !strings.HasSuffix(e.Name, suffix) {
+			break
+		}
+
+		var addr string
+		if len(e.AddrV4) > 0 {
+			addr = e.AddrV4.String()
+		} else if len(e.AddrV6) > 0 {
+			addr = "[" + e.AddrV6.String() + "]"
+		} else {
+			addr = e.Addr.String()
+		}
+
+		txt.Endpoints = append(txt.Endpoints, fmt.Sprintf("%s:%d", addr, e.Port))
+		services = append(services, &registry.ServiceInstance{
+			ID:        strings.TrimSuffix(e.Name, suffix),
+			Name:      e.Name,
+			Version:   txt.Version,
+			Metadata:  txt.Metadata,
+			Endpoints: txt.Endpoints,
+		})
+
+	}
+
+	return services, nil
+
 }
 
 func (m *mdnsWatcher) Stop() error {

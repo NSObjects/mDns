@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	log "github.com/asim/go-micro/v3/logger"
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -194,7 +193,7 @@ func (s *Server) recv(c *net.UDPConn) {
 			continue
 		}
 		if err := s.parsePacket(buf[:n], from); err != nil {
-			log.Errorf("[ERR] mdns: Failed to handle query: %v", err)
+			//log.Errorf("[ERR] mdns: Failed to handle query: %v", err)
 		}
 	}
 }
@@ -382,7 +381,7 @@ func (s *Server) probe() {
 
 	for i := 0; i < 3; i++ {
 		if err := s.SendMulticast(q); err != nil {
-			log.Errorf("[ERR] mdns: failed to send probe:", err.Error())
+			//log.Errorf("[ERR] mdns: failed to send probe:", err.Error())
 		}
 		time.Sleep(time.Duration(randomizer.Intn(250)) * time.Millisecond)
 	}
@@ -408,7 +407,7 @@ func (s *Server) probe() {
 	timer := time.NewTimer(timeout)
 	for i := 0; i < 3; i++ {
 		if err := s.SendMulticast(resp); err != nil {
-			log.Errorf("[ERR] mdns: failed to send announcement:", err.Error())
+			//log.Errorf("[ERR] mdns: failed to send announcement:", err.Error())
 		}
 		select {
 		case <-timer.C:
